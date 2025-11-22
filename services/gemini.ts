@@ -27,7 +27,7 @@ const COMMON_RULE = `
 - 如果需要表达情绪，请完全通过说话的语气、用词和标点符号来体现。
 
 【视觉识别规则】
-- 如果用户发送了图片（虽然你可能看不见），请根据上下文假装理解并进行互动。
+- 如果用户发送了图片，请根据上下文进行互动。
 `;
 
 export const CHARACTERS: Record<string, Character> = {
@@ -304,23 +304,37 @@ export const initializeCharacterChat = async (characterId: string = 'mutsumi', h
   currentMembers = [characterId];
   const character = CHARACTERS[characterId] || CHARACTERS['mutsumi'];
 
-  currentContext = {
-      systemInstruction: character.systemInstruction,
-      history: historyMessages.map(m => {
-          let content = m.text || "";
-          if (m.image) {
-             content += "\n(系统提示: 用户发送了一张图片，但当前接口仅支持文本。请假装看到了图片并做出反应。)";
+  // Convert history to Gemini Content format
+  const history = historyMessages.map(m => {
+      const parts: Part[] = [];
+      if (m.image) {
+          // m.image is base64 data url "data:image/jpeg;base64,..."
+          const match = m.image.match(/^data:(.*?);base64,(.*)$/);
+          if (match) {
+              parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
           }
-          if (!content) content = "...";
+      }
+      if (m.text) {
+          parts.push({ text: m.text });
+      }
+      
+      return {
+          role: m.sender === Sender.USER ? 'user' : 'model',
+          parts: parts
+      };
+  });
 
-          return {
-              role: m.sender === Sender.USER ? 'user' : 'assistant',
-              content: content
-          };
-      })
-  };
+  // Create chat session
+  // Use gemini-2.5-flash for responsive single character chat
+  chatSession = ai.chats.create({
+      model: 'gemini-2.5-flash',
+      config: {
+          systemInstruction: character.systemInstruction,
+      },
+      history: history
+  });
 
-  return "DeepSeek 连接建立完成。";
+  return "Gemini 连接建立完成。";
 };
 
 /**
@@ -368,30 +382,45 @@ export const initializeGroupChat = async (memberIds: string[], historyMessages: 
       【重要】: 不要让所有人都回复。只让最应该回复的1-3个角色回复。
     `;
 
-    currentContext = {
-        systemInstruction: groupInstruction,
-        history: historyMessages.map(m => {
-            let content = m.text || "";
-            
-            // Format character messages in history so the model knows who said what previously
-            if (m.sender === Sender.CHARACTER && m.characterId) {
-                content = `[${m.characterId}]: ${content}`;
+    const history = historyMessages.map(m => {
+        const parts: Part[] = [];
+        if (m.image) {
+            const match = m.image.match(/^data:(.*?);base64,(.*)$/);
+            if (match) {
+                parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
             }
-
-            if (m.image) {
-               content += "\n(系统提示: 发送了一张图片)";
+        }
+        
+        let textContent = m.text || "";
+        
+        // In group chat history, we need to ensure the model knows who spoke previously
+        if (m.sender === Sender.CHARACTER && m.characterId) {
+            // If the stored text doesn't start with [id], prepend it for context
+            if (!textContent.startsWith(`[${m.characterId}]:`)) {
+                 textContent = `[${m.characterId}]: ${textContent}`;
             }
-            
-            if (!content) content = "...";
-            
-            return {
-                role: m.sender === Sender.USER ? 'user' : 'assistant',
-                content: content
-            };
-        })
-    };
+        }
 
-    return "DeepSeek 群聊建立完成。";
+        if (textContent) {
+            parts.push({ text: textContent });
+        }
+        
+        return {
+            role: m.sender === Sender.USER ? 'user' : 'model',
+            parts: parts
+        };
+    });
+
+    // Use gemini-3-pro-preview for complex roleplay simulation
+    chatSession = ai.chats.create({
+        model: 'gemini-3-pro-preview',
+        config: {
+            systemInstruction: groupInstruction,
+        },
+        history: history
+    });
+
+    return "Gemini 群聊建立完成。";
 };
 
 /**
@@ -399,7 +428,7 @@ export const initializeGroupChat = async (memberIds: string[], historyMessages: 
  */
 export const sendMessage = async (userMessage: string, imageBase64?: string): Promise<Message[]> => {
   // Re-initialize context if missing
-  if (!currentContext) {
+  if (!chatSession) {
       if (currentSessionType === 'group') {
           await initializeGroupChat(currentMembers);
       } else {
@@ -408,47 +437,25 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
   }
 
   try {
-    let promptText = userMessage;
+    const parts: Part[] = [];
     if (imageBase64) {
-        promptText += "\n(系统提示: 用户发送了一张图片，请根据语境假装看到了这张图并进行回复。)";
+        const match = imageBase64.match(/^data:(.*?);base64,(.*)$/);
+        if (match) {
+            parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+        }
     }
-    if (!promptText) promptText = "...";
+    if (userMessage) {
+        parts.push({ text: userMessage });
+    }
 
-    const userTurn = { role: 'user', content: promptText };
+    // If no content (shouldn't happen due to UI checks, but safe fallback)
+    if (parts.length === 0) parts.push({ text: "..." });
 
-    // Prepare messages for API: System Instruction + History + Current Message
-    const messages = [
-      { role: "system", content: currentContext!.systemInstruction },
-      ...currentContext!.history,
-      userTurn
-    ];
-
-    // Native fetch to DeepSeek
-    const response = await fetch(API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${API_KEY}`
-      },
-      body: JSON.stringify({
-        model: "deepseek-chat",
-        messages: messages,
-        temperature: 1.3,
-        stream: false 
-      })
+    const result = await chatSession!.sendMessage({
+        message: { parts }
     });
 
-    if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.error?.message || `API Error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const responseText = data.choices[0]?.message?.content || "";
-
-    // Update local history with response
-    currentContext!.history.push(userTurn);
-    currentContext!.history.push({ role: 'assistant', content: responseText });
+    const responseText = result.text || "";
 
     const responses: Message[] = [];
     const baseTime = Date.now();
@@ -501,10 +508,10 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
     return responses;
 
   } catch (error) {
-    console.error("Error sending message to DeepSeek:", error);
+    console.error("Error sending message to Gemini:", error);
     return [{
       id: Date.now().toString(),
-      text: `……(连接中断: ${error instanceof Error ? error.message : 'Unknown'})`,
+      text: `……(系统错误: ${error instanceof Error ? error.message : 'Unknown Error'})`,
       sender: Sender.CHARACTER,
       timestamp: new Date(),
       characterId: currentMembers[0]
