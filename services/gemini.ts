@@ -1,14 +1,17 @@
-import { GoogleGenAI } from "@google/genai";
 import { Message, Sender, Character } from "../types";
 
-// --- Google GenAI Configuration ---
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// --- DeepSeek Configuration ---
+
+// Use import.meta.env.VITE_API_KEY for Vercel/Vite compatibility
+// Fallback to process.env.API_KEY only if needed, but strictly prefer VITE_ prefix in frontend
+const API_KEY = import.meta.env.VITE_API_KEY || process.env.API_KEY;
+const API_URL = "https://api.deepseek.com/chat/completions";
 
 // Local state to track the active conversation context
 interface ConversationContext {
   systemInstruction: string;
-  // Gemini format history
-  history: { role: string; parts: { text?: string; inlineData?: { mimeType: string; data: string } }[] }[];
+  // DeepSeek (OpenAI) format history
+  history: { role: string; content: string }[];
 }
 
 let currentContext: ConversationContext | null = null;
@@ -24,9 +27,7 @@ const COMMON_RULE = `
 - 如果需要表达情绪，请完全通过说话的语气、用词和标点符号来体现。
 
 【视觉识别规则】
-- 用户可能会发送图片。
-- 本模型可能无法直接查看图片，但请根据系统提示假装你能看到，或询问用户图片里有什么。
-- 不要假装你能看清楚图片的细节，除非用户用文字描述了它。
+- 如果用户发送了图片（虽然你可能看不见），请根据上下文假装理解并进行互动。
 `;
 
 export const CHARACTERS: Record<string, Character> = {
@@ -295,11 +296,6 @@ export const CHARACTERS: Record<string, Character> = {
   }
 };
 
-// Helper to remove data URL prefix for Gemini
-const cleanBase64 = (dataUrl: string) => {
-  return dataUrl.replace(/^data:image\/\w+;base64,/, "");
-};
-
 /**
  * Initializes a Single Character Chat
  */
@@ -311,21 +307,20 @@ export const initializeCharacterChat = async (characterId: string = 'mutsumi', h
   currentContext = {
       systemInstruction: character.systemInstruction,
       history: historyMessages.map(m => {
-          const parts: any[] = [];
+          let content = m.text || "";
           if (m.image) {
-              parts.push({ inlineData: { mimeType: 'image/jpeg', data: cleanBase64(m.image) } });
+             content += "\n(系统提示: 用户发送了一张图片，但当前接口仅支持文本。请假装看到了图片并做出反应。)";
           }
-          if (m.text) {
-              parts.push({ text: m.text });
-          }
+          if (!content) content = "...";
+
           return {
-              role: m.sender === Sender.USER ? 'user' : 'model',
-              parts: parts
+              role: m.sender === Sender.USER ? 'user' : 'assistant',
+              content: content
           };
       })
   };
 
-  return "Gemini 连接建立完成。";
+  return "DeepSeek 连接建立完成。";
 };
 
 /**
@@ -369,7 +364,6 @@ export const initializeGroupChat = async (memberIds: string[], historyMessages: 
          - **角色ID必须完全匹配上述角色ID**。
          - 不要输出任何剧本旁白。
       3. **用户交互**: 用户是群里的一个普通成员。
-      4. **视觉识别**: 如果用户发送了图片，请假装你能看到，或者询问用户图片内容，不要直接说"我看不到图片"。
       
       【重要】: 不要让所有人都回复。只让最应该回复的1-3个角色回复。
     `;
@@ -377,25 +371,27 @@ export const initializeGroupChat = async (memberIds: string[], historyMessages: 
     currentContext = {
         systemInstruction: groupInstruction,
         history: historyMessages.map(m => {
-            const parts: any[] = [];
+            let content = m.text || "";
+            
+            // Format character messages in history so the model knows who said what previously
+            if (m.sender === Sender.CHARACTER && m.characterId) {
+                content = `[${m.characterId}]: ${content}`;
+            }
+
             if (m.image) {
-                parts.push({ inlineData: { mimeType: 'image/jpeg', data: cleanBase64(m.image) } });
+               content += "\n(系统提示: 发送了一张图片)";
             }
             
-            let text = m.text;
-            if (m.sender === Sender.CHARACTER && m.characterId) {
-                text = `[${m.characterId}]: ${m.text}`;
-            }
-            if (text) parts.push({ text });
-
+            if (!content) content = "...";
+            
             return {
-                role: m.sender === Sender.USER ? 'user' : 'model',
-                parts: parts
+                role: m.sender === Sender.USER ? 'user' : 'assistant',
+                content: content
             };
         })
     };
 
-    return "Gemini 群聊建立完成。";
+    return "DeepSeek 群聊建立完成。";
 };
 
 /**
@@ -412,32 +408,47 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
   }
 
   try {
-    // Construct new user message content
-    const userParts: any[] = [];
+    let promptText = userMessage;
     if (imageBase64) {
-        userParts.push({ inlineData: { mimeType: 'image/jpeg', data: cleanBase64(imageBase64) } });
+        promptText += "\n(系统提示: 用户发送了一张图片，请根据语境假装看到了这张图并进行回复。)";
     }
-    if (userMessage) {
-        userParts.push({ text: userMessage });
-    }
+    if (!promptText) promptText = "...";
 
-    // Update local history
-    currentContext!.history.push({ role: 'user', parts: userParts });
+    const userTurn = { role: 'user', content: promptText };
 
-    // API Call to Gemini
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        config: {
-            systemInstruction: currentContext!.systemInstruction,
-            temperature: 1,
-        },
-        contents: currentContext!.history
+    // Prepare messages for API: System Instruction + History + Current Message
+    const messages = [
+      { role: "system", content: currentContext!.systemInstruction },
+      ...currentContext!.history,
+      userTurn
+    ];
+
+    // Native fetch to DeepSeek
+    const response = await fetch(API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: messages,
+        temperature: 1.3,
+        stream: false 
+      })
     });
 
-    const responseText = response.text || "";
+    if (!response.ok) {
+      const err = await response.json();
+      throw new Error(err.error?.message || `API Error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const responseText = data.choices[0]?.message?.content || "";
 
     // Update local history with response
-    currentContext!.history.push({ role: 'model', parts: [{ text: responseText }] });
+    currentContext!.history.push(userTurn);
+    currentContext!.history.push({ role: 'assistant', content: responseText });
 
     const responses: Message[] = [];
     const baseTime = Date.now();
@@ -465,9 +476,8 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
             }
         }
 
-        // Fallback if regex fails but text exists (sometimes model forgets format)
+        // Fallback if regex fails but text exists
         if (!found && responseText.trim()) {
-             // Try to infer character or default to first member
              responses.push({
                 id: baseTime.toString(),
                 text: responseText,
@@ -491,10 +501,10 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
     return responses;
 
   } catch (error) {
-    console.error("Error sending message to Gemini:", error);
+    console.error("Error sending message to DeepSeek:", error);
     return [{
       id: Date.now().toString(),
-      text: `……(信号中断: ${error instanceof Error ? error.message : 'Unknown'})`,
+      text: `……(连接中断: ${error instanceof Error ? error.message : 'Unknown'})`,
       sender: Sender.CHARACTER,
       timestamp: new Date(),
       characterId: currentMembers[0]
