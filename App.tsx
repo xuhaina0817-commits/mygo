@@ -1,6 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import * as React from 'react';
 import { CHARACTERS, initializeCharacterChat, initializeGroupChat, sendMessage } from './services/gemini';
 import { Message, Sender, Session, Character } from './types';
+
+const { useState, useEffect, useRef } = React;
 
 // --- Constants ---
 const STORAGE_KEY = 'mutsumi_chat_sessions_v4';
