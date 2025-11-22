@@ -2,19 +2,38 @@ import { Message, Sender, Character } from "../types";
 
 // --- DeepSeek Configuration ---
 
-// Use import.meta.env.VITE_API_KEY for Vercel/Vite compatibility
-// Fallback to process.env.API_KEY only if needed, but strictly prefer VITE_ prefix in frontend
-const API_KEY = import.meta.env.VITE_API_KEY || process.env.API_KEY;
+// Safe Environment Variable Access for Vercel/Vite
+const getApiKey = () => {
+  try {
+    // @ts-ignore
+    if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_KEY) {
+      // @ts-ignore
+      return import.meta.env.VITE_API_KEY;
+    }
+  } catch (e) {}
+  
+  try {
+    if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+      return process.env.API_KEY;
+    }
+  } catch (e) {}
+  
+  return '';
+};
+
+const API_KEY = getApiKey();
 const API_URL = "https://api.deepseek.com/chat/completions";
 
 // Local state to track the active conversation context
-interface ConversationContext {
-  systemInstruction: string;
-  // DeepSeek (OpenAI) format history
-  history: { role: string; content: string }[];
+// DeepSeek/OpenAI format: { role: 'system' | 'user' | 'assistant', content: string }
+interface OpenAIMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
 }
 
-let currentContext: ConversationContext | null = null;
+// Maintain history locally since REST API is stateless
+let currentSystemInstruction: string = "";
+let conversationHistory: OpenAIMessage[] = [];
 let currentSessionType: 'single' | 'group' = 'single';
 let currentMembers: string[] = [];
 
@@ -27,7 +46,7 @@ const COMMON_RULE = `
 - 如果需要表达情绪，请完全通过说话的语气、用词和标点符号来体现。
 
 【视觉识别规则】
-- 如果用户发送了图片，请根据上下文进行互动。
+- 如果收到图片提示，请假装看到了图片并根据上下文互动，不要说"我看不见"。
 `;
 
 export const CHARACTERS: Record<string, Character> = {
@@ -297,6 +316,34 @@ export const CHARACTERS: Record<string, Character> = {
 };
 
 /**
+ * Helper to convert internal Message format to DeepSeek/OpenAI format
+ */
+const mapMessagesToHistory = (historyMessages: Message[]): OpenAIMessage[] => {
+    return historyMessages.map(m => {
+        let content = m.text || "";
+        
+        // IMPORTANT: DeepSeek V3 (Chat) is primarily text. 
+        // If there is an image, we must convert it to a text hint, 
+        // otherwise the API might error if we send raw image bytes not supported by the text model.
+        if (m.image) {
+            content = `[系统: 用户发送了一张图片] ${content}`;
+        }
+
+        // For Group Chat History Restoration
+        if (currentSessionType === 'group' && m.sender === Sender.CHARACTER && m.characterId) {
+             if (!content.startsWith(`[${m.characterId}]:`)) {
+                 content = `[${m.characterId}]: ${content}`;
+            }
+        }
+
+        return {
+            role: m.sender === Sender.USER ? 'user' : 'assistant',
+            content: content
+        };
+    });
+};
+
+/**
  * Initializes a Single Character Chat
  */
 export const initializeCharacterChat = async (characterId: string = 'mutsumi', historyMessages: Message[] = []): Promise<string> => {
@@ -304,37 +351,11 @@ export const initializeCharacterChat = async (characterId: string = 'mutsumi', h
   currentMembers = [characterId];
   const character = CHARACTERS[characterId] || CHARACTERS['mutsumi'];
 
-  // Convert history to Gemini Content format
-  const history = historyMessages.map(m => {
-      const parts: Part[] = [];
-      if (m.image) {
-          // m.image is base64 data url "data:image/jpeg;base64,..."
-          const match = m.image.match(/^data:(.*?);base64,(.*)$/);
-          if (match) {
-              parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
-          }
-      }
-      if (m.text) {
-          parts.push({ text: m.text });
-      }
-      
-      return {
-          role: m.sender === Sender.USER ? 'user' : 'model',
-          parts: parts
-      };
-  });
+  // Reset and Rebuild History
+  currentSystemInstruction = character.systemInstruction;
+  conversationHistory = mapMessagesToHistory(historyMessages);
 
-  // Create chat session
-  // Use gemini-2.5-flash for responsive single character chat
-  chatSession = ai.chats.create({
-      model: 'gemini-2.5-flash',
-      config: {
-          systemInstruction: character.systemInstruction,
-      },
-      history: history
-  });
-
-  return "Gemini 连接建立完成。";
+  return "DeepSeek 连接建立完成。";
 };
 
 /**
@@ -382,80 +403,67 @@ export const initializeGroupChat = async (memberIds: string[], historyMessages: 
       【重要】: 不要让所有人都回复。只让最应该回复的1-3个角色回复。
     `;
 
-    const history = historyMessages.map(m => {
-        const parts: Part[] = [];
-        if (m.image) {
-            const match = m.image.match(/^data:(.*?);base64,(.*)$/);
-            if (match) {
-                parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
-            }
-        }
-        
-        let textContent = m.text || "";
-        
-        // In group chat history, we need to ensure the model knows who spoke previously
-        if (m.sender === Sender.CHARACTER && m.characterId) {
-            // If the stored text doesn't start with [id], prepend it for context
-            if (!textContent.startsWith(`[${m.characterId}]:`)) {
-                 textContent = `[${m.characterId}]: ${textContent}`;
-            }
-        }
+    currentSystemInstruction = groupInstruction;
+    conversationHistory = mapMessagesToHistory(historyMessages);
 
-        if (textContent) {
-            parts.push({ text: textContent });
-        }
-        
-        return {
-            role: m.sender === Sender.USER ? 'user' : 'model',
-            parts: parts
-        };
-    });
-
-    // Use gemini-3-pro-preview for complex roleplay simulation
-    chatSession = ai.chats.create({
-        model: 'gemini-3-pro-preview',
-        config: {
-            systemInstruction: groupInstruction,
-        },
-        history: history
-    });
-
-    return "Gemini 群聊建立完成。";
+    return "DeepSeek 群聊建立完成。";
 };
 
 /**
  * Sends a message and returns an ARRAY of responses (to handle group chat flows)
  */
 export const sendMessage = async (userMessage: string, imageBase64?: string): Promise<Message[]> => {
-  // Re-initialize context if missing
-  if (!chatSession) {
-      if (currentSessionType === 'group') {
-          await initializeGroupChat(currentMembers);
-      } else {
-          await initializeCharacterChat(currentMembers[0] || 'mutsumi');
-      }
+  if (!API_KEY) {
+      return [{
+          id: Date.now().toString(),
+          text: "错误: 未配置 DeepSeek API Key。请在 Vercel 环境变量中添加 VITE_API_KEY。",
+          sender: Sender.SYSTEM,
+          timestamp: new Date()
+      }];
   }
 
   try {
-    const parts: Part[] = [];
+    let contentToSend = userMessage;
     if (imageBase64) {
-        const match = imageBase64.match(/^data:(.*?);base64,(.*)$/);
-        if (match) {
-            parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
-        }
+        contentToSend = `[系统: 用户发送了一张图片。请假装看到了图片并做出反应。] ${userMessage}`;
     }
-    if (userMessage) {
-        parts.push({ text: userMessage });
-    }
+    
+    // Add User Message to History
+    const userMsgObj: OpenAIMessage = { role: 'user', content: contentToSend };
+    conversationHistory.push(userMsgObj);
 
-    // If no content (shouldn't happen due to UI checks, but safe fallback)
-    if (parts.length === 0) parts.push({ text: "..." });
+    // Construct Payload
+    // DeepSeek requires the system prompt to be part of the messages or a specific system parameter.
+    // Standard OpenAI format puts system prompt as the first message.
+    const messagesPayload = [
+        { role: 'system', content: currentSystemInstruction },
+        ...conversationHistory
+    ];
 
-    const result = await chatSession!.sendMessage({
-        message: { parts }
+    const response = await fetch(API_URL, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${API_KEY}`
+        },
+        body: JSON.stringify({
+            model: "deepseek-chat",
+            messages: messagesPayload,
+            stream: false,
+            temperature: 1.3 // DeepSeek recommends higher temperature for creativity
+        })
     });
 
-    const responseText = result.text || "";
+    if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`DeepSeek API Error: ${response.status} - ${err}`);
+    }
+
+    const data = await response.json();
+    const responseText = data.choices?.[0]?.message?.content || "";
+
+    // Add Assistant Response to History
+    conversationHistory.push({ role: 'assistant', content: responseText });
 
     const responses: Message[] = [];
     const baseTime = Date.now();
@@ -508,7 +516,10 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
     return responses;
 
   } catch (error) {
-    console.error("Error sending message to Gemini:", error);
+    console.error("Error sending message to DeepSeek:", error);
+    // Remove the last user message from history if failed, to allow retry
+    conversationHistory.pop();
+    
     return [{
       id: Date.now().toString(),
       text: `……(系统错误: ${error instanceof Error ? error.message : 'Unknown Error'})`,
