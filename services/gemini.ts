@@ -2,13 +2,12 @@ import { GoogleGenAI } from "@google/genai";
 import { Message, Sender, Character } from "../types";
 
 // --- Google GenAI Configuration ---
-// Always use named parameter for API key
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 // Local state to track the active conversation context
 interface ConversationContext {
   systemInstruction: string;
-  // History in Gemini format
+  // Gemini format history
   history: { role: string; parts: { text?: string; inlineData?: { mimeType: string; data: string } }[] }[];
 }
 
@@ -26,7 +25,7 @@ const COMMON_RULE = `
 
 【视觉识别规则】
 - 用户可能会发送图片。
-- 请根据上下文模糊回应，或者询问用户图片里有什么。
+- 本模型可能无法直接查看图片，但请根据系统提示假装你能看到，或询问用户图片里有什么。
 - 不要假装你能看清楚图片的细节，除非用户用文字描述了它。
 `;
 
@@ -296,6 +295,11 @@ export const CHARACTERS: Record<string, Character> = {
   }
 };
 
+// Helper to remove data URL prefix for Gemini
+const cleanBase64 = (dataUrl: string) => {
+  return dataUrl.replace(/^data:image\/\w+;base64,/, "");
+};
+
 /**
  * Initializes a Single Character Chat
  */
@@ -304,26 +308,21 @@ export const initializeCharacterChat = async (characterId: string = 'mutsumi', h
   currentMembers = [characterId];
   const character = CHARACTERS[characterId] || CHARACTERS['mutsumi'];
 
-  const history = historyMessages.map(m => {
-      const parts: any[] = [];
-      if (m.image) {
-          // m.image is data url "data:image/jpeg;base64,..."
-          const base64Data = m.image.split(',')[1];
-          const mimeType = m.image.split(';')[0].split(':')[1];
-          parts.push({ inlineData: { mimeType, data: base64Data } });
-      }
-      if (m.text) {
-          parts.push({ text: m.text });
-      }
-      return {
-          role: m.sender === Sender.USER ? 'user' : 'model',
-          parts: parts
-      };
-  });
-
   currentContext = {
       systemInstruction: character.systemInstruction,
-      history: history
+      history: historyMessages.map(m => {
+          const parts: any[] = [];
+          if (m.image) {
+              parts.push({ inlineData: { mimeType: 'image/jpeg', data: cleanBase64(m.image) } });
+          }
+          if (m.text) {
+              parts.push({ text: m.text });
+          }
+          return {
+              role: m.sender === Sender.USER ? 'user' : 'model',
+              parts: parts
+          };
+      })
   };
 
   return "Gemini 连接建立完成。";
@@ -375,30 +374,25 @@ export const initializeGroupChat = async (memberIds: string[], historyMessages: 
       【重要】: 不要让所有人都回复。只让最应该回复的1-3个角色回复。
     `;
 
-    // 2. Convert History
-    const history = historyMessages.map(m => {
-        const parts: any[] = [];
-        if (m.image) {
-            const base64Data = m.image.split(',')[1];
-            const mimeType = m.image.split(';')[0].split(':')[1];
-            parts.push({ inlineData: { mimeType, data: base64Data } });
-        }
-        let text = m.text;
-        if (m.sender === Sender.CHARACTER && m.characterId) {
-            text = `[${m.characterId}]: ${m.text}`;
-        }
-        if (text) {
-             parts.push({ text: text });
-        }
-        return {
-            role: m.sender === Sender.USER ? 'user' : 'model',
-            parts: parts
-        };
-    });
-
     currentContext = {
         systemInstruction: groupInstruction,
-        history: history
+        history: historyMessages.map(m => {
+            const parts: any[] = [];
+            if (m.image) {
+                parts.push({ inlineData: { mimeType: 'image/jpeg', data: cleanBase64(m.image) } });
+            }
+            
+            let text = m.text;
+            if (m.sender === Sender.CHARACTER && m.characterId) {
+                text = `[${m.characterId}]: ${m.text}`;
+            }
+            if (text) parts.push({ text });
+
+            return {
+                role: m.sender === Sender.USER ? 'user' : 'model',
+                parts: parts
+            };
+        })
     };
 
     return "Gemini 群聊建立完成。";
@@ -418,29 +412,26 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
   }
 
   try {
-    const parts: any[] = [];
+    // Construct new user message content
+    const userParts: any[] = [];
     if (imageBase64) {
-        const base64Data = imageBase64.split(',')[1];
-        const mimeType = imageBase64.split(';')[0].split(':')[1];
-        parts.push({ inlineData: { mimeType, data: base64Data } });
+        userParts.push({ inlineData: { mimeType: 'image/jpeg', data: cleanBase64(imageBase64) } });
     }
     if (userMessage) {
-        parts.push({ text: userMessage });
+        userParts.push({ text: userMessage });
     }
 
     // Update local history
-    const newUserContent = { role: 'user', parts };
-    currentContext!.history.push(newUserContent);
+    currentContext!.history.push({ role: 'user', parts: userParts });
 
-    // Call API
-    // Use gemini-2.5-flash for basic text tasks as per guidelines
+    // API Call to Gemini
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: currentContext!.history,
-      config: {
-        systemInstruction: currentContext!.systemInstruction,
-        temperature: 1.1, // Creative
-      }
+        model: 'gemini-2.5-flash',
+        config: {
+            systemInstruction: currentContext!.systemInstruction,
+            temperature: 1,
+        },
+        contents: currentContext!.history
     });
 
     const responseText = response.text || "";
@@ -474,8 +465,9 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
             }
         }
 
-        // Fallback if regex fails but text exists
+        // Fallback if regex fails but text exists (sometimes model forgets format)
         if (!found && responseText.trim()) {
+             // Try to infer character or default to first member
              responses.push({
                 id: baseTime.toString(),
                 text: responseText,
@@ -502,7 +494,7 @@ export const sendMessage = async (userMessage: string, imageBase64?: string): Pr
     console.error("Error sending message to Gemini:", error);
     return [{
       id: Date.now().toString(),
-      text: "……(信号中断)",
+      text: `……(信号中断: ${error instanceof Error ? error.message : 'Unknown'})`,
       sender: Sender.CHARACTER,
       timestamp: new Date(),
       characterId: currentMembers[0]
